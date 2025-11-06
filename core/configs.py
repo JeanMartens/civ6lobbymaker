@@ -227,3 +227,5 @@ LEADERS_TO_LINK = {
     "Bà triêu (Vietnam)": "https://civ6bbg.github.io/en_US/leaders_7.2.html#Vietnam%20B%C3%A0%20Tri%E1%BB%87u",
     "Chaka (Zoulous)": "https://civ6bbg.github.io/en_US/leaders_7.2.html#Zulu%20Shaka",
 }
+
+LEADERS = list(LEADERS_TO_LINK.keys())

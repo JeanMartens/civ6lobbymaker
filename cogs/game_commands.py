@@ -1,10 +1,17 @@
+"""
+Discord slash commands for game management
+"""
 import discord
 from discord import app_commands
 from discord.ext import commands
 from core.game_manager import GameManager
 from core.configs import CIV_EMOJI_CONFIG, GAME_OPTIONS
+from utils.voting import format_vote_details
+
 
 class GameCommands(commands.Cog):
+    """Game management commands"""
+    
     def __init__(self, bot):
         self.bot = bot
         self.manager = GameManager()
@@ -15,6 +22,7 @@ class GameCommands(commands.Cog):
         civ_pool_size="Taille du pool de civilisations disponibles"
     )
     async def create(self, interaction: discord.Interaction, max_bans: int = 2, civ_pool_size: int = 6):
+        """Create a new game"""
         if max_bans < 0 or max_bans > 10:
             await interaction.response.send_message(
                 "❌ Le nombre de bans doit être entre 0 et 10.", ephemeral=True
@@ -27,13 +35,8 @@ class GameCommands(commands.Cog):
             )
             return
         
-        # Create game first (without thread_id)
-        game = self.manager.create_game(
-            interaction.user.id, 
-            max_bans, 
-            civ_pool_size,
-            None  # Will set thread_id after creation
-        )
+        # Create game first
+        game = self.manager.create_game(interaction.user.id, max_bans, civ_pool_size, None)
         
         # Create initial message with view
         view = self.manager.create_join_view(game["id"])
@@ -49,21 +52,20 @@ class GameCommands(commands.Cog):
             view=view
         )
         
-        # Get the message to create thread from it
+        # Get message and create thread
         initial_msg = await interaction.original_response()
         
-        # Create thread from the message
         try:
             thread = await initial_msg.create_thread(
                 name=f"Partie {game['id']} - {interaction.user.name}",
-                auto_archive_duration=1440  # 24 hours
+                auto_archive_duration=1440
             )
             
             # Update game with thread_id
             game["thread_id"] = thread.id
-            self.manager.storage.save()
+            self.manager.save()
             
-            # Edit message to include thread mention
+            # Edit message to include thread
             await initial_msg.edit(
                 content=(
                     f"🎮 **Partie {game['id']} créée !**\n\n"
@@ -76,7 +78,7 @@ class GameCommands(commands.Cog):
                 view=view
             )
             
-            # Send welcome message in thread
+            # Welcome message in thread
             await thread.send(
                 f"🎉 Bienvenue dans la partie {game['id']} !\n\n"
                 f"Créateur: {interaction.user.mention}\n"
@@ -86,73 +88,60 @@ class GameCommands(commands.Cog):
             )
             
         except Exception as e:
-            # Thread creation failed, but game still works without it
             print(f"⚠️ Erreur lors de la création du thread: {e}")
-            # Game will fall back to channel messages
 
     @app_commands.command(name="progress", description="Voir la progression des votes, bans et sélections")
     async def progress(self, interaction: discord.Interaction, game_id: str):
-        game = self.manager.storage.get_by_id(game_id)
+        """Show game progress"""
+        game = self.manager.get_game(game_id)
         
         if not game:
-            await interaction.response.send_message(
-                "❌ Partie introuvable !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Partie introuvable !", ephemeral=True)
             return
         
         msg = f"## 📊 Progression - Partie {game_id}\n\n"
         
         # Voting progress
         if game.get("voting_started"):
-            progress = self.manager.get_voting_progress(game_id)
-            
-            if progress:
-                msg += "### 🗳️ Votes\n"
-                completed_count = 0
-                for player_id, data in progress.items():
-                    user = await self.bot.fetch_user(player_id)
-                    status = "✅" if data["completed"] else "⏳"
-                    msg += f"{status} **{user.name}**: {data['voted_categories']}/{data['total_categories']} catégories\n"
-                    if data["completed"]:
-                        completed_count += 1
-                
-                msg += f"\n**Total votes**: {completed_count}/{len(progress)} joueurs\n\n"
+            msg += "### 🗳️ Votes\n"
+            completed = 0
+            for player_id in game["players"]:
+                user = await self.bot.fetch_user(player_id)
+                votes = game.get("votes", {}).get(str(player_id), {})
+                status = "✅" if len(votes) == len(GAME_OPTIONS) else "⏳"
+                msg += f"{status} **{user.name}**: {len(votes)}/{len(GAME_OPTIONS)} catégories\n"
+                if len(votes) == len(GAME_OPTIONS):
+                    completed += 1
+            msg += f"\n**Total**: {completed}/{len(game['players'])} joueurs\n\n"
         
         # Ban progress
         if game.get("banning_started"):
-            ban_progress = self.manager.get_ban_progress(game_id)
-            
-            if ban_progress:
-                msg += "### 🚫 Bans\n"
-                completed_count = 0
-                for player_id, data in ban_progress.items():
-                    user = await self.bot.fetch_user(player_id)
-                    status = "✅" if data["completed"] else "⏳"
-                    msg += f"{status} **{user.name}**: {data['bans_count']}/{data['max_bans']} ban(s)\n"
-                    if data["completed"]:
-                        completed_count += 1
-                
-                msg += f"\n**Total bans**: {completed_count}/{len(ban_progress)} joueurs\n\n"
+            msg += "### 🚫 Bans\n"
+            completed = 0
+            for player_id in game["players"]:
+                user = await self.bot.fetch_user(player_id)
+                bans = game.get("bans", {}).get(str(player_id), [])
+                status = "✅" if str(player_id) in game.get("bans", {}) else "⏳"
+                msg += f"{status} **{user.name}**: {len(bans)}/{game.get('max_bans', 2)} ban(s)\n"
+                if str(player_id) in game.get("bans", {}):
+                    completed += 1
+            msg += f"\n**Total**: {completed}/{len(game['players'])} joueurs\n\n"
         
         # Selection progress
         if game.get("selection_started"):
-            selection_progress = self.manager.get_selection_progress(game_id)
-            
-            if selection_progress:
-                msg += "### 🎯 Sélection des civilisations\n"
-                completed_count = 0
-                for player_id, data in selection_progress.items():
-                    user = await self.bot.fetch_user(player_id)
-                    status = "✅" if data["completed"] else "⏳"
-                    if data["completed"] and data["selection"]:
-                        emoji = CIV_EMOJI_CONFIG.get(data["selection"], "")
-                        msg += f"{status} **{user.name}**: {emoji} {data['selection']}\n"
-                    else:
-                        msg += f"{status} **{user.name}**: En attente...\n"
-                    if data["completed"]:
-                        completed_count += 1
-                
-                msg += f"\n**Total sélections**: {completed_count}/{len(selection_progress)} joueurs\n"
+            msg += "### 🎯 Sélection des civilisations\n"
+            completed = 0
+            for player_id in game["players"]:
+                user = await self.bot.fetch_user(player_id)
+                civ = game.get("civ_selections", {}).get(str(player_id))
+                status = "✅" if civ else "⏳"
+                if civ:
+                    emoji = CIV_EMOJI_CONFIG.get(civ, "")
+                    msg += f"{status} **{user.name}**: {emoji} {civ}\n"
+                    completed += 1
+                else:
+                    msg += f"{status} **{user.name}**: En attente...\n"
+            msg += f"\n**Total**: {completed}/{len(game['players'])} joueurs\n"
         
         if not game.get("voting_started"):
             msg += "Les votes n'ont pas encore commencé."
@@ -161,379 +150,79 @@ class GameCommands(commands.Cog):
 
     @app_commands.command(name="votes_details", description="Voir les détails complets des votes")
     async def votes_details(self, interaction: discord.Interaction, game_id: str):
-        game = self.manager.storage.get_by_id(game_id)
+        """Show detailed voting results"""
+        game = self.manager.get_game(game_id)
         
         if not game:
-            await interaction.response.send_message(
-                "❌ Partie introuvable !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Partie introuvable !", ephemeral=True)
             return
         
         if not game.get("votes"):
-            await interaction.response.send_message(
-                "❌ Aucun vote enregistré pour cette partie !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Aucun vote enregistré !", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True)
         
-        # Get weighted results
-        weighted_results = self.manager.calculate_weighted_results(game_id)
+        weighted_results = game.get("final_settings", {})
         
-        # Build detailed message for each category
+        # Send details for each category
         for category in GAME_OPTIONS.keys():
             if category not in weighted_results:
                 continue
-                
-            result_data = weighted_results[category]
-            selected = result_data["selected"]
-            votes_count = result_data["votes"]
             
-            msg = f"## {category}\n"
-            msg += f"**✅ Sélectionné**: {selected}\n\n"
-            msg += f"**Détail des votes**:\n"
-            
-            # Sort by vote count (descending)
-            sorted_votes = sorted(votes_count.items(), key=lambda x: x[1], reverse=True)
-            for option, count in sorted_votes:
-                percentage = (count / len(game["votes"])) * 100
-                is_winner = "🏆" if option == selected else "  "
-                msg += f"{is_winner} **{option}**: {count} vote(s) ({percentage:.0f}%)\n"
-            
-            msg += "\n"
-            
+            msg = format_vote_details(category, weighted_results[category], len(game["votes"]))
             await interaction.followup.send(msg, ephemeral=True)
-        
-        # Send individual player votes summary
-        player_msg = "## 👥 Votes par joueur\n\n"
-        for player_id, votes in game["votes"].items():
-            try:
-                user = await self.bot.fetch_user(int(player_id))
-                player_msg += f"**{user.name}**:\n"
-                
-                # Show all votes in compact format
-                for i, (category, choice) in enumerate(votes.items()):
-                    player_msg += f"  • {category}: {choice}\n"
-                    
-                    # Split into multiple messages if too long
-                    if len(player_msg) > 1800:
-                        await interaction.followup.send(player_msg, ephemeral=True)
-                        player_msg = f"**{user.name}** (suite):\n"
-                
-                player_msg += "\n"
-                
-            except Exception as e:
-                player_msg += f"**Joueur {player_id}**: {len(votes)} votes\n\n"
-        
-        if player_msg.strip() != "## 👥 Votes par joueur":
-            await interaction.followup.send(player_msg, ephemeral=True)
 
     @app_commands.command(name="results", description="Afficher les résultats des votes et bans")
     async def results(self, interaction: discord.Interaction, game_id: str):
-        game = self.manager.storage.get_by_id(game_id)
+        """Display final results"""
+        game = self.manager.get_game(game_id)
         
         if not game:
-            await interaction.response.send_message(
-                "❌ Partie introuvable !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Partie introuvable !", ephemeral=True)
             return
         
         if interaction.user.id != game["creator"]:
-            await interaction.response.send_message(
-                "❌ Seul le créateur peut afficher les résultats !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Seul le créateur peut afficher les résultats !", ephemeral=True)
             return
         
         if not game.get("voting_started"):
-            await interaction.response.send_message(
-                "❌ Les votes n'ont pas encore commencé !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Les votes n'ont pas encore commencé !", ephemeral=True)
             return
         
         await interaction.response.defer()
         
-        # Get thread or channel
         channel_id = game.get("thread_id") or interaction.channel_id
         try:
             channel = await self.bot.fetch_channel(channel_id)
-            await self.manager.send_final_results(channel, game_id)
-            await interaction.followup.send(
-                f"✅ Les résultats ont été publiés dans le thread de la partie."
-            )
+            await self.manager._send_final_results(channel, game_id)
+            await interaction.followup.send("✅ Les résultats ont été publiés dans le thread.")
         except Exception as e:
-            await interaction.followup.send(
-                f"❌ Erreur lors de la publication des résultats: {e}"
-            )
-
-    @app_commands.command(name="force_bans", description="[Admin] Forcer le début de la phase de bans")
-    @app_commands.default_permissions(administrator=True)
-    async def force_bans(self, interaction: discord.Interaction, game_id: str):
-        game = self.manager.storage.get_by_id(game_id)
-        
-        if not game:
-            await interaction.response.send_message(
-                "❌ Partie introuvable !", ephemeral=True
-            )
-            return
-        
-        if game.get("banning_started"):
-            await interaction.response.send_message(
-                "❌ La phase de bans a déjà commencé !", ephemeral=True
-            )
-            return
-        
-        # Mark as banning started
-        game["banning_started"] = True
-        thread_id = game.get("thread_id")
-        game["results_channel_id"] = thread_id or interaction.channel_id
-        self.manager.storage.save()
-        
-        await interaction.response.send_message(
-            f"🚫 Phase de bans forcée pour la partie {game_id} !"
-        )
-        
-        # Calculate results
-        weighted_results = self.manager.calculate_weighted_results(game_id)
-        
-        # Get the thread or channel
-        channel_id = thread_id or interaction.channel_id
-        channel = await self.bot.fetch_channel(channel_id)
-        
-        results_msg = "## 🎲 Paramètres sélectionnés pour la partie\n\n"
-        for category, result_data in weighted_results.items():
-            results_msg += f"**{category}**: {result_data['selected']}\n"
-        
-        await channel.send(results_msg)
-        
-        # Send ban interface to players
-        failed_users = []
-        for player_id in game["players"]:
-            try:
-                user = await self.bot.fetch_user(player_id)
-                await self.manager.send_ban_interface(
-                    user, game_id, player_id, 
-                    game.get("max_bans", 2), 
-                    weighted_results
-                )
-            except Exception as e:
-                failed_users.append(f"<@{player_id}>")
-                print(f"❌ Erreur lors de l'envoi du ban à {player_id}: {e}")
-        
-        if failed_users:
-            await channel.send(
-                f"⚠️ Impossible d'envoyer la phase de ban à: {', '.join(failed_users)}"
-            )
-
-    @app_commands.command(name="force_selection", description="[Admin] Forcer le début de la phase de sélection")
-    @app_commands.default_permissions(administrator=True)
-    async def force_selection(self, interaction: discord.Interaction, game_id: str):
-        game = self.manager.storage.get_by_id(game_id)
-        
-        if not game:
-            await interaction.response.send_message(
-                "❌ Partie introuvable !", ephemeral=True
-            )
-            return
-        
-        if game.get("selection_started"):
-            await interaction.response.send_message(
-                "❌ La phase de sélection a déjà commencé !", ephemeral=True
-            )
-            return
-        
-        # Mark as selection started
-        game["selection_started"] = True
-        self.manager.storage.save()
-        
-        await interaction.response.send_message(
-            f"🎯 Phase de sélection forcée pour la partie {game_id} !"
-        )
-        
-        # Assign civilization pools
-        if not self.manager.assign_civ_pools(game_id):
-            channel_id = game.get("thread_id") or interaction.channel_id
-            channel = await self.bot.fetch_channel(channel_id)
-            await channel.send(
-                "❌ Erreur: Pas assez de civilisations disponibles pour tous les joueurs!"
-            )
-            return
-        
-        # Send selection interface to players
-        failed_users = []
-        for player_id in game["players"]:
-            try:
-                await self.manager.send_civ_selection_interface(
-                    self.bot, game_id, player_id
-                )
-            except Exception as e:
-                failed_users.append(f"<@{player_id}>")
-                print(f"❌ Erreur lors de l'envoi de la sélection à {player_id}: {e}")
-        
-        if failed_users:
-            channel_id = game.get("thread_id") or interaction.channel_id
-            channel = await self.bot.fetch_channel(channel_id)
-            await channel.send(
-                f"⚠️ Impossible d'envoyer la phase de sélection à: {', '.join(failed_users)}"
-            )
-
-    @app_commands.command(name="show_civs", description="Afficher toutes les civilisations avec leurs emojis")
-    async def show_civs(self, interaction: discord.Interaction, page: int = 1):
-        """Show civilizations with their emojis in pages"""
-        
-        # Calculate pagination
-        civs_per_page = 25
-        total_civs = len(CIV_EMOJI_CONFIG)
-        total_pages = (total_civs + civs_per_page - 1) // civs_per_page
-        
-        # Validate page number
-        if page < 1 or page > total_pages:
-            await interaction.response.send_message(
-                f"❌ Page invalide. Utilise un nombre entre 1 et {total_pages}.",
-                ephemeral=True
-            )
-            return
-        
-        # Get civs for this page
-        start_idx = (page - 1) * civs_per_page
-        end_idx = min(start_idx + civs_per_page, total_civs)
-        
-        civs_list = list(CIV_EMOJI_CONFIG.items())
-        page_civs = civs_list[start_idx:end_idx]
-        
-        # Build message
-        msg = f"## 🗺️ Civilisations (Page {page}/{total_pages})\n\n"
-        for civ, emoji in page_civs:
-            msg += f"{emoji} **{civ}**\n"
-        
-        if page < total_pages:
-            msg += f"\n*Utilise `/show_civs page:{page+1}` pour voir la page suivante*"
-        
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @app_commands.command(name="test_ban", description="[Test] Tester l'interface de ban")
-    @app_commands.default_permissions(administrator=True)
-    async def test_ban(self, interaction: discord.Interaction):
-        """Test command to see the ban interface"""
-        
-        # Create a fake game for testing
-        test_results = {
-            "Carte": {"selected": "Continents"},
-            "Climat": {"selected": "Classique"},
-            "Camps de Barbares": {"selected": "Standard"}
-        }
-        
-        await interaction.response.send_message(
-            "📧 Test envoyé en MP ! Vérifie tes messages privés.",
-            ephemeral=True
-        )
-        
-        try:
-            await self.manager.send_ban_interface(
-                interaction.user, 
-                "TEST-ID", 
-                interaction.user.id, 
-                3,  # max bans
-                test_results
-            )
-        except Exception as e:
-            await interaction.followup.send(
-                f"❌ Erreur lors de l'envoi: {e}",
-                ephemeral=True
-            )
-
-    @app_commands.command(name="test_selection", description="[Test] Tester l'interface de sélection")
-    @app_commands.default_permissions(administrator=True)
-    async def test_selection(self, interaction: discord.Interaction):
-        """Test command to see the civilization selection interface"""
-        
-        # Create a fake game for testing
-        game_id = "TEST-SEL"
-        test_game = {
-            "id": game_id,
-            "creator": interaction.user.id,
-            "players": [interaction.user.id],
-            "civ_pool_size": 3,
-            "civ_pools": {
-                str(interaction.user.id): ["Abraham Lincoln (Amérique)", "Alexandre (Macédoine)", "Chaka (Zoulous)"]
-            }
-        }
-        
-        # Temporarily add to storage
-        self.manager.storage.data.append(test_game)
-        self.manager.storage.save()
-        
-        await interaction.response.send_message(
-            "📧 Test envoyé en MP ! Vérifie tes messages privés.",
-            ephemeral=True
-        )
-        
-        try:
-            await self.manager.send_civ_selection_interface(
-                self.bot,
-                game_id,
-                interaction.user.id
-            )
-        except Exception as e:
-            await interaction.followup.send(
-                f"❌ Erreur lors de l'envoi: {e}",
-                ephemeral=True
-            )
-
-    @app_commands.command(name="check_duplicates", description="Voir les emojis utilisés par plusieurs civilisations")
-    async def check_duplicates(self, interaction: discord.Interaction):
-        """Show which emojis are used by multiple civilizations"""
-        
-        # Find duplicates
-        emoji_count = {}
-        for civ, emoji in CIV_EMOJI_CONFIG.items():
-            if emoji not in emoji_count:
-                emoji_count[emoji] = []
-            emoji_count[emoji].append(civ)
-        
-        duplicates = {emoji: civs for emoji, civs in emoji_count.items() if len(civs) > 1}
-        
-        if not duplicates:
-            await interaction.response.send_message(
-                "✅ Aucun emoji dupliqué ! Chaque civilisation a un emoji unique.",
-                ephemeral=True
-            )
-            return
-        
-        msg = "## ⚠️ Emojis utilisés par plusieurs civilisations\n\n"
-        msg += "*Ces emojis banniront toutes les civilisations associées:*\n\n"
-        
-        for emoji, civs in duplicates.items():
-            msg += f"{emoji} est utilisé par:\n"
-            for civ in civs:
-                msg += f"  • {civ}\n"
-            msg += "\n"
-        
-        await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.followup.send(f"❌ Erreur: {e}")
 
     @app_commands.command(name="delete", description="Supprimer une partie existante")
     async def delete(self, interaction: discord.Interaction, game_id: str):
-        game = self.manager.storage.get_by_id(game_id)
+        """Delete a game"""
+        game = self.manager.get_game(game_id)
+        
         if not game:
             await interaction.response.send_message("❌ Partie introuvable !", ephemeral=True)
             return
+        
         if interaction.user.id != game["creator"]:
             await interaction.response.send_message("❌ Seul le créateur peut supprimer la partie !", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True)
         
-        # Notify players in thread if it exists
+        # Notify in thread
         thread_id = game.get("thread_id")
         if thread_id:
             try:
                 thread = await self.bot.fetch_channel(thread_id)
                 
-                # Build player mentions
-                player_mentions = []
-                for player_id in game.get("players", []):
-                    player_mentions.append(f"<@{player_id}>")
+                player_mentions = [f"<@{pid}>" for pid in game.get("players", [])]
                 
-                # Send notification message
                 if player_mentions:
                     await thread.send(
                         f"🗑️ **Cette partie a été supprimée par le créateur.**\n\n"
@@ -546,20 +235,49 @@ class GameCommands(commands.Cog):
                         f"Ce thread va être archivé."
                     )
                 
-                # Close/archive the thread
+                # Archive thread
                 await thread.edit(archived=True, locked=True)
                 
             except Exception as e:
                 print(f"⚠️ Erreur lors de la fermeture du thread: {e}")
         
-        # Delete the game from storage
+        # Delete game
         self.manager.storage.delete(game_id)
-        self.manager.storage.save()
+        self.manager.save()
         
         await interaction.followup.send(
-            f"🗑️ Partie {game_id} supprimée avec succès. Le thread a été archivé et les joueurs ont été notifiés.",
+            f"🗑️ Partie {game_id} supprimée avec succès.",
             ephemeral=True
         )
+
+    @app_commands.command(name="show_civs", description="Afficher toutes les civilisations avec leurs emojis")
+    async def show_civs(self, interaction: discord.Interaction, page: int = 1):
+        """Show civilizations list"""
+        civs_per_page = 25
+        total_civs = len(CIV_EMOJI_CONFIG)
+        total_pages = (total_civs + civs_per_page - 1) // civs_per_page
+        
+        if page < 1 or page > total_pages:
+            await interaction.response.send_message(
+                f"❌ Page invalide. Utilise 1-{total_pages}.",
+                ephemeral=True
+            )
+            return
+        
+        start_idx = (page - 1) * civs_per_page
+        end_idx = min(start_idx + civs_per_page, total_civs)
+        
+        civs_list = list(CIV_EMOJI_CONFIG.items())
+        page_civs = civs_list[start_idx:end_idx]
+        
+        msg = f"## 🗺️ Civilisations (Page {page}/{total_pages})\n\n"
+        for civ, emoji in page_civs:
+            msg += f"{emoji} **{civ}**\n"
+        
+        if page < total_pages:
+            msg += f"\n*Utilise `/show_civs page:{page+1}` pour la suite*"
+        
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 async def setup(bot):
