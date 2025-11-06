@@ -27,16 +27,68 @@ class GameCommands(commands.Cog):
             )
             return
         
-        game = self.manager.create_game(interaction.user.id, max_bans, civ_pool_size)
+        # Create game first (without thread_id)
+        game = self.manager.create_game(
+            interaction.user.id, 
+            max_bans, 
+            civ_pool_size,
+            None  # Will set thread_id after creation
+        )
+        
+        # Create initial message with view
         view = self.manager.create_join_view(game["id"])
+        
         await interaction.response.send_message(
-            f"🎮 **Partie {game['id']} créée !**\n\n"
-            f"**Bans par joueur**: {max_bans}\n"
-            f"**Civilisations proposées par joueur**: {civ_pool_size}\n\n"
-            f"Les joueurs peuvent rejoindre en cliquant sur le bouton ci-dessous.\n"
-            f"Une fois que tout le monde est prêt, clique sur 'Commencer les votes'.",
+            content=(
+                f"🎮 **Partie {game['id']} créée !**\n\n"
+                f"**Bans par joueur**: {max_bans}\n"
+                f"**Civilisations proposées par joueur**: {civ_pool_size}\n\n"
+                f"Les joueurs peuvent rejoindre en cliquant sur le bouton ci-dessous.\n"
+                f"Une fois que tout le monde est prêt, clique sur 'Commencer les votes'."
+            ),
             view=view
         )
+        
+        # Get the message to create thread from it
+        initial_msg = await interaction.original_response()
+        
+        # Create thread from the message
+        try:
+            thread = await initial_msg.create_thread(
+                name=f"Partie {game['id']} - {interaction.user.name}",
+                auto_archive_duration=1440  # 24 hours
+            )
+            
+            # Update game with thread_id
+            game["thread_id"] = thread.id
+            self.manager.storage.save()
+            
+            # Edit message to include thread mention
+            await initial_msg.edit(
+                content=(
+                    f"🎮 **Partie {game['id']} créée !**\n\n"
+                    f"**Bans par joueur**: {max_bans}\n"
+                    f"**Civilisations proposées par joueur**: {civ_pool_size}\n\n"
+                    f"Les joueurs peuvent rejoindre en cliquant sur le bouton ci-dessous.\n"
+                    f"Une fois que tout le monde est prêt, clique sur 'Commencer les votes'.\n\n"
+                    f"📝 Toutes les discussions se feront dans {thread.mention}"
+                ),
+                view=view
+            )
+            
+            # Send welcome message in thread
+            await thread.send(
+                f"🎉 Bienvenue dans la partie {game['id']} !\n\n"
+                f"Créateur: {interaction.user.mention}\n"
+                f"**Bans par joueur**: {max_bans}\n"
+                f"**Civilisations proposées**: {civ_pool_size}\n\n"
+                f"Les joueurs peuvent rejoindre en cliquant sur le bouton dans le message ci-dessus."
+            )
+            
+        except Exception as e:
+            # Thread creation failed, but game still works without it
+            print(f"⚠️ Erreur lors de la création du thread: {e}")
+            # Game will fall back to channel messages
 
     @app_commands.command(name="progress", description="Voir la progression des votes, bans et sélections")
     async def progress(self, interaction: discord.Interaction, game_id: str):
@@ -200,17 +252,17 @@ class GameCommands(commands.Cog):
         
         await interaction.response.defer()
         
-        thread = await self.manager.create_final_results_thread(
-            interaction.channel, game_id
-        )
-        
-        if thread:
+        # Get thread or channel
+        channel_id = game.get("thread_id") or interaction.channel_id
+        try:
+            channel = await self.bot.fetch_channel(channel_id)
+            await self.manager.send_final_results(channel, game_id)
             await interaction.followup.send(
-                f"✅ Les résultats ont été publiés dans {thread.mention}"
+                f"✅ Les résultats ont été publiés dans le thread de la partie."
             )
-        else:
+        except Exception as e:
             await interaction.followup.send(
-                "❌ Erreur lors de la création du thread de résultats."
+                f"❌ Erreur lors de la publication des résultats: {e}"
             )
 
     @app_commands.command(name="force_bans", description="[Admin] Forcer le début de la phase de bans")
@@ -232,7 +284,8 @@ class GameCommands(commands.Cog):
         
         # Mark as banning started
         game["banning_started"] = True
-        game["results_channel_id"] = interaction.channel_id
+        thread_id = game.get("thread_id")
+        game["results_channel_id"] = thread_id or interaction.channel_id
         self.manager.storage.save()
         
         await interaction.response.send_message(
@@ -242,11 +295,15 @@ class GameCommands(commands.Cog):
         # Calculate results
         weighted_results = self.manager.calculate_weighted_results(game_id)
         
+        # Get the thread or channel
+        channel_id = thread_id or interaction.channel_id
+        channel = await self.bot.fetch_channel(channel_id)
+        
         results_msg = "## 🎲 Paramètres sélectionnés pour la partie\n\n"
         for category, result_data in weighted_results.items():
             results_msg += f"**{category}**: {result_data['selected']}\n"
         
-        await interaction.channel.send(results_msg)
+        await channel.send(results_msg)
         
         # Send ban interface to players
         failed_users = []
@@ -263,7 +320,7 @@ class GameCommands(commands.Cog):
                 print(f"❌ Erreur lors de l'envoi du ban à {player_id}: {e}")
         
         if failed_users:
-            await interaction.channel.send(
+            await channel.send(
                 f"⚠️ Impossible d'envoyer la phase de ban à: {', '.join(failed_users)}"
             )
 
@@ -294,7 +351,9 @@ class GameCommands(commands.Cog):
         
         # Assign civilization pools
         if not self.manager.assign_civ_pools(game_id):
-            await interaction.channel.send(
+            channel_id = game.get("thread_id") or interaction.channel_id
+            channel = await self.bot.fetch_channel(channel_id)
+            await channel.send(
                 "❌ Erreur: Pas assez de civilisations disponibles pour tous les joueurs!"
             )
             return
@@ -311,7 +370,9 @@ class GameCommands(commands.Cog):
                 print(f"❌ Erreur lors de l'envoi de la sélection à {player_id}: {e}")
         
         if failed_users:
-            await interaction.channel.send(
+            channel_id = game.get("thread_id") or interaction.channel_id
+            channel = await self.bot.fetch_channel(channel_id)
+            await channel.send(
                 f"⚠️ Impossible d'envoyer la phase de sélection à: {', '.join(failed_users)}"
             )
 
@@ -393,12 +454,12 @@ class GameCommands(commands.Cog):
             "players": [interaction.user.id],
             "civ_pool_size": 3,
             "civ_pools": {
-                str(interaction.user.id): ["Lincoln (Abraham)", "Alexandre", "Chaka"]
+                str(interaction.user.id): ["Abraham Lincoln (Amérique)", "Alexandre (Macédoine)", "Chaka (Zoulous)"]
             }
         }
         
         # Temporarily add to storage
-        self.manager.storage.data[game_id] = test_game
+        self.manager.storage.data.append(test_game)
         self.manager.storage.save()
         
         await interaction.response.send_message(
@@ -458,9 +519,47 @@ class GameCommands(commands.Cog):
         if interaction.user.id != game["creator"]:
             await interaction.response.send_message("❌ Seul le créateur peut supprimer la partie !", ephemeral=True)
             return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Notify players in thread if it exists
+        thread_id = game.get("thread_id")
+        if thread_id:
+            try:
+                thread = await self.bot.fetch_channel(thread_id)
+                
+                # Build player mentions
+                player_mentions = []
+                for player_id in game.get("players", []):
+                    player_mentions.append(f"<@{player_id}>")
+                
+                # Send notification message
+                if player_mentions:
+                    await thread.send(
+                        f"🗑️ **Cette partie a été supprimée par le créateur.**\n\n"
+                        f"Joueurs concernés: {', '.join(player_mentions)}\n\n"
+                        f"Ce thread va être archivé."
+                    )
+                else:
+                    await thread.send(
+                        f"🗑️ **Cette partie a été supprimée par le créateur.**\n\n"
+                        f"Ce thread va être archivé."
+                    )
+                
+                # Close/archive the thread
+                await thread.edit(archived=True, locked=True)
+                
+            except Exception as e:
+                print(f"⚠️ Erreur lors de la fermeture du thread: {e}")
+        
+        # Delete the game from storage
         self.manager.storage.delete(game_id)
         self.manager.storage.save()
-        await interaction.response.send_message(f"🗑️ Partie {game_id} supprimée avec succès.", ephemeral=True)
+        
+        await interaction.followup.send(
+            f"🗑️ Partie {game_id} supprimée avec succès. Le thread a été archivé et les joueurs ont été notifiés.",
+            ephemeral=True
+        )
 
 
 async def setup(bot):

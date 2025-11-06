@@ -662,7 +662,7 @@ class GameManager:
     def __init__(self):
         self.storage = Storage("data/games.json")
 
-    def create_game(self, creator_id, max_bans=2, civ_pool_size=3):
+    def create_game(self, creator_id, max_bans=2, civ_pool_size=3, thread_id=None):
         game_id = str(uuid.uuid4())[:8]
         game = {
             "id": game_id,
@@ -678,6 +678,7 @@ class GameManager:
             "banning_started": False,
             "selection_started": False,
             "results_channel_id": None,
+            "thread_id": thread_id,
         }
         self.storage.add(game)
         return game
@@ -702,9 +703,27 @@ class GameManager:
             if inter.user.id not in game["players"]:
                 game["players"].append(inter.user.id)
                 self.storage.save()
-                await inter.response.send_message(
-                    f"{inter.user.mention} a rejoint la partie !", ephemeral=False
-                )
+                
+                # Send join message to thread
+                thread_id = game.get("thread_id")
+                if thread_id:
+                    try:
+                        thread = await inter.client.fetch_channel(thread_id)
+                        await thread.send(f"{inter.user.mention} a rejoint la partie !")
+                        await inter.response.send_message(
+                            f"Tu as rejoint la partie ! Suis la conversation dans le thread.", 
+                            ephemeral=True
+                        )
+                    except:
+                        await inter.response.send_message(
+                            f"{inter.user.mention} a rejoint la partie !", 
+                            ephemeral=False
+                        )
+                else:
+                    await inter.response.send_message(
+                        f"{inter.user.mention} a rejoint la partie !", 
+                        ephemeral=False
+                    )
             else:
                 await inter.response.send_message(
                     "Tu es déjà dans la partie.", ephemeral=True
@@ -725,16 +744,32 @@ class GameManager:
                 return
 
             game["voting_started"] = True
-            game["results_channel_id"] = inter.channel_id
+            game["results_channel_id"] = game.get("thread_id") or inter.channel_id
             self.storage.save()
 
             join_button.disabled = True
             start_button.disabled = True
             await inter.message.edit(view=view)
 
-            await inter.response.send_message(
-                "🗳️ Les votes ont commencé ! Chaque joueur va recevoir un message privé."
-            )
+            # Send start message to thread
+            thread_id = game.get("thread_id")
+            if thread_id:
+                try:
+                    thread = await inter.client.fetch_channel(thread_id)
+                    await inter.response.send_message(
+                        "Les votes démarrent...", ephemeral=True
+                    )
+                    await thread.send(
+                        "🗳️ Les votes ont commencé ! Chaque joueur va recevoir un message privé."
+                    )
+                except:
+                    await inter.response.send_message(
+                        "🗳️ Les votes ont commencé ! Chaque joueur va recevoir un message privé."
+                    )
+            else:
+                await inter.response.send_message(
+                    "🗳️ Les votes ont commencé ! Chaque joueur va recevoir un message privé."
+                )
 
             failed_users = []
             for player_id in game["players"]:
@@ -755,7 +790,8 @@ class GameManager:
                     print(f"❌ Erreur lors de l'envoi du message à {player_id}: {e}")
             
             if failed_users:
-                await inter.channel.send(
+                target_channel = thread if thread_id else inter.channel
+                await target_channel.send(
                     f"⚠️ Impossible d'envoyer les MPs à : {', '.join(failed_users)}\n"
                     f"Ils doivent activer les MPs depuis les membres du serveur dans leurs paramètres de confidentialité."
                 )
@@ -960,8 +996,8 @@ class GameManager:
             game["banning_started"] = True
             self.storage.save()
             
-            # Send settings to players and start ban phase
-            channel_id = game.get("results_channel_id")
+            # Send settings to thread
+            channel_id = game.get("thread_id") or game.get("results_channel_id")
             if channel_id:
                 try:
                     channel = await bot.fetch_channel(channel_id)
@@ -1019,7 +1055,7 @@ class GameManager:
             
             # Assign civilization pools
             if not self.assign_civ_pools(game_id):
-                channel_id = game.get("results_channel_id")
+                channel_id = game.get("thread_id") or game.get("results_channel_id")
                 if channel_id:
                     try:
                         channel = await bot.fetch_channel(channel_id)
@@ -1030,8 +1066,8 @@ class GameManager:
                         pass
                 return
             
-            # Notify in channel
-            channel_id = game.get("results_channel_id")
+            # Notify in thread
+            channel_id = game.get("thread_id") or game.get("results_channel_id")
             if channel_id:
                 try:
                     channel = await bot.fetch_channel(channel_id)
@@ -1072,18 +1108,17 @@ class GameManager:
         all_complete = all(p["completed"] for p in selection_progress.values())
         
         if all_complete:
-            # Create final results thread with selections
-            channel_id = game.get("results_channel_id")
+            # Create final results in thread
+            channel_id = game.get("thread_id") or game.get("results_channel_id")
             if channel_id:
                 try:
                     channel = await bot.fetch_channel(channel_id)
-                    thread = await self.create_final_results_thread(channel, game_id)
-                    if thread:
-                        await channel.send(
-                            f"🎊 Tous les joueurs ont choisi leur civilisation ! Les résultats finaux sont dans {thread.mention}"
-                        )
+                    await self.send_final_results(channel, game_id)
+                    await channel.send(
+                        f"🎊 Tous les joueurs ont choisi leur civilisation ! Les résultats finaux sont ci-dessus."
+                    )
                 except Exception as e:
-                    print(f"Erreur lors de la création du thread final: {e}")
+                    print(f"Erreur lors de la création des résultats finaux: {e}")
 
     def calculate_weighted_results(self, game_id, force_recalculate=False):
         game = self.storage.get_by_id(game_id)
@@ -1157,16 +1192,11 @@ class GameManager:
         available = [(CIV_EMOJI_CONFIG.get(civ, ""), civ) for civ in LEADERS if civ not in banned_civs]
         return available
 
-    async def create_final_results_thread(self, channel, game_id):
+    async def send_final_results(self, channel, game_id):
+        """Send final results directly to channel (no thread creation)"""
         game = self.storage.get_by_id(game_id)
         if not game:
             return None
-
-        thread = await channel.create_thread(
-            name=f"Résultats Finaux - Partie {game_id}",
-            type=discord.ChannelType.public_thread,
-            auto_archive_duration=1440,
-        )
 
         # Calculate weighted random results
         weighted_results = self.calculate_weighted_results(game_id)
@@ -1182,7 +1212,7 @@ class GameManager:
             winning_votes = votes_count.get(selected, 0)
             settings_msg += f"**{category}**: {selected} ({winning_votes}/{total_votes} votes)\n"
         
-        await thread.send(settings_msg)
+        await channel.send(settings_msg)
         
         # Second message: Player selections
         selections_msg = "## 👑 Civilisations choisies par les joueurs\n\n"
@@ -1200,7 +1230,7 @@ class GameManager:
         else:
             selections_msg += "*Aucune sélection effectuée*\n"
         
-        await thread.send(selections_msg)
+        await channel.send(selections_msg)
         
         # Third message: Banned civilizations
         bans_msg = "## 🚫 Civilisations bannies\n\n"
@@ -1224,7 +1254,7 @@ class GameManager:
         else:
             bans_msg += "*Aucune civilisation bannie*\n"
         
-        await thread.send(bans_msg)
+        await channel.send(bans_msg)
         
         # Fourth message: Available civilizations (that weren't chosen)
         available_civs = self.get_available_civs(game_id)
@@ -1248,13 +1278,17 @@ class GameManager:
                 avail_chunks.append(current_msg)
             
             for msg in avail_chunks[:2]:  # Limit to 2 messages
-                await thread.send(msg)
+                await channel.send(msg)
             
             if len(avail_chunks) > 2:
-                await thread.send(f"*... et d'autres civilisations disponibles*")
+                await channel.send(f"*... et d'autres civilisations disponibles*")
         
-        return thread
+        return True
+
+    async def create_final_results_thread(self, channel, game_id):
+        """Legacy method - now just sends results to thread"""
+        return await self.send_final_results(channel, game_id)
 
     async def create_results_thread(self, channel, game_id):
         """Legacy method for compatibility"""
-        return await self.create_final_results_thread(channel, game_id)
+        return await self.send_final_results(channel, game_id)
