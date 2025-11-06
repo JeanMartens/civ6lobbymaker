@@ -115,4 +115,3 @@ Game data is stored in JSON format including:
 - Results channel reference
 
 This ensures games can survive bot restarts.
->>>>>>> master
